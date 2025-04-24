@@ -15,7 +15,7 @@ class CNN(nn.Module):
         self.pool = nn.MaxPool2d(2, 2)         # MAX-POOLING: 2x2 pool size
         self.fc1 = nn.Linear(16 * 5 * 5, 120)  # FC LAYER: 16 filters * 5x5 image size after pooling = 400 input nodes
         self.fc2 = nn.Linear(120, 84)          # FC LAYER: 120 nodes to 84
-        self.fc3 = nn.Linear(84, 11)           # OUTPUT: 84 nodes to 10 classes (digits 0-9 + "no digit" class)
+        self.fc3 = nn.Linear(84, 11)           # OUTPUT: 84 nodes to 11 classes (digits 0-9 + "no digit" class)
 
     # Defines How Input Data Flows Through Layers During Prediction, (effectively telling the model by hand how to move data through the layers*)
     def forward(self, x):

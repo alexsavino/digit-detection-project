@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import rc
 import seaborn as sns
+from PIL import Image
 
 import cv2
 import scipy
@@ -19,6 +20,7 @@ from torch.utils.data import TensorDataset, DataLoader, Subset
 import torchvision
 from torchvision.models import vgg16, VGG16_Weights
 import torchvision.transforms as transforms
+
 
 def create_plot(error_type):
 

@@ -1,179 +1,315 @@
-import os
-import time
-from tqdm import tqdm
-import numpy as np 
-import matplotlib.pyplot as plt
-
-import cv2
-import scipy
-from sklearn.model_selection import KFold
-
 import torch
-import torch.optim as optim
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader, Subset
-
+import torch.optim as optim
 import torchvision
-from torchvision.models import vgg16, VGG16_Weights
 import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
+import numpy as np
+import matplotlib.pyplot as plt
+from torchvision.models import vgg16
+from PIL import Image
+import os
+import random
 
 
-
-# --- DEFINING EITHER CNN / VGG16 TRAINING + EVALUATION PIPELINE FOR A GIVEN COMBINATION OF HYPERPARAMETERS ---
-def train_and_evaluate_model(base_dataset_path, model_name, loss_function, learning_rate, batch_size):
+class SimpleDataset(Dataset):
+    def __init__(self, samples, labels):
+        self.samples = samples
+        self.labels = labels
     
-    start_time = time.time()
-    best_validation_error = float('inf')
-    best_model_state = None # To store the state of the best model
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        return self.samples[idx], self.labels[idx]
 
-    # Properly Loading in All Data ..............................................................
-    training_dataset = None
-    testing_dataset = None
-    for child in os.listdir(base_dataset_path):
-        child_path = os.path.join(base_dataset_path, child)
-        if child.startswith('train'):
-            if os.path.isfile(child_path):
-                if child.endswith('.mat'):
-                    training_dataset = raw_data_to_tensor_dataset(child_path, batch_size)
-            # elif os.path.isdir(child_path)
-        elif child.startswith('test'):
-            if os.path.isfile(child_path):
-                if child.endswith('.mat'):
-                    testing_dataset = raw_data_to_tensor_dataset(child_path, batch_size)
-            # elif os.path.isdir(child_path)
-            
-    if training_dataset is None or testing_dataset is None:
-        raise ValueError("Training or testing dataset not found.")
+# --- DEFINING THE ORIGINAL MODEL ---
+class CNN(nn.Module):
+    # Defines Model Layers + General Structure
+    def __init__(self):
+        # ("CNN" --> made up of convolutional layers, pooling layers, and fully connected layers (i.e. each node from the previous layer factors into / is connected to the fully-connected layer))
+        # ("conv layer" --> uses filters to detect features in images)
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 6, 5)                                                                     # CONV: 3 input channels (RGB), 6 output filters,  5x5 kernel
+        self.conv2 = nn.Conv2d(6, 16, 5)                                                                    # CONV: 6 input filters,        16 output filters, 5x5 kernel
+        self.pool = nn.MaxPool2d(2, 2)                                                                      # MAX-POOLING: 2x2 pool size
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)                                                               # FC LAYER: 16 filters * 5x5 image size after pooling = 400 input nodes
+        self.fc2 = nn.Linear(120, 84)                                                                       # FC LAYER: 120 nodes to 84
+        self.fc3 = nn.Linear(84, 11)                                                                        # OUTPUT: 84 nodes to 11 classes (digits 0-9 + "no digit" class)
 
-    # Defining the (constant) loss function......................................................
-    if loss_function=='cross-entropy':
+    # Defines How Input Data Flows Through Layers During Prediction, (effectively telling the model by hand how to move data through the layers*)
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))                                                                # applying conv. + max-pooling (using RELU!!)
+        x = self.pool(F.relu(self.conv2(x)))
+        x = torch.flatten(x, 1)                                                                             # flattening the tensor so it can pass through the FC layers
+        x = F.relu(self.fc1(x))                                                                             # applying the FC layers (again using RELU!!)
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)                                                                                     # output prediction
+        return x
+
+# --- DEFINING THE VGG16 MODEL FOR FINE-TUNING ---
+class VGG16(nn.Module):
+    def __init__(self, num_classes=11):                                                                     # there will be 0-9 + non-digit class, i.e. 11 classes
+        super(VGG16, self).__init__()
+        vgg = vgg16(pretrained=True)                                                                        # loading in the pre-trained weights
+        
+        vgg.features[0] = nn.Conv2d(3, 64, kernel_size=3, padding=1)                                        # CHANGING THE FIRST LAYER SO THAT IT ACCEPTS ONLY 32X32 IMAGES
+        self.features = vgg.features
+        
+        self.classifier = nn.Sequential( # modifying the classifier to match our input size and number of output classes??? COME BACK!!!
+            nn.Linear(512 * 1 * 1, 512),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        ) 
+        for m in self.classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):                                                                                   # defines data flow ... i think?
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x
+
+# --- DEFINING A FUNCTION TO GENERATE RANDOM NOISE IMAGES TO TRAIN FOR NON-DIGIT EXAMPLES!!! ---
+def generate_non_digit_samples(transform, num_samples):
+    SAMPLES = []
+    LABELS = []
+    
+    for _ in range(num_samples//3):
+        img = np.random.randint(0, 256, (32, 32, 3), dtype=np.uint8)
+        img = Image.fromarray(img)
+        if transform:
+            img = transform(img)
+        SAMPLES.append(img)
+        LABELS.append(10)
+    
+    for _ in range(num_samples//3):
+        img = np.zeros((32, 32, 3), dtype=np.uint8)
+        for i in range(32):
+            for j in range(32):
+                r = (i*8) % 256
+                g = (j*8) % 256
+                b = ((i+j) * 4) % 256
+                img[i, j] = [r, g, b]
+        img = Image.fromarray(img)
+        if transform:
+            img = transform(img)
+        SAMPLES.append(img)
+        LABELS.append(10)
+    
+    for _ in range(num_samples // 3):
+        img = np.zeros((32, 32, 3), dtype=np.uint8)
+        pattern_type = random.randint(0, 1)
+        
+        if pattern_type==0:                                                                               # stripe pattern*
+            stripe_width = random.randint(1, 5)
+            color1 = [random.randint(0, 255) for _ in range(3)]
+            color2 = [random.randint(0, 255) for _ in range(3)]
+            for i in range(32):
+                for j in range(32):
+                    if (i // stripe_width) % 2 == 0:
+                        img[i,j] = color1
+                    else:
+                        img[i,j] = color2
+        
+        elif pattern_type==1:                                                                             # checkerboard random pattern
+            square_size = random.randint(2, 8)
+            color1 = [random.randint(0, 255) for _ in range(3)]
+            color2 = [random.randint(0, 255) for _ in range(3)]
+            for i in range(32):
+                for j in range(32):
+                    if ((i // square_size) + (j // square_size)) % 2 == 0:
+                        img[i,j] = color1
+                    else:
+                        img[i,j] = color2
+        
+        img = Image.fromarray(img)
+        if transform:
+            img = transform(img)
+        SAMPLES.append(img)
+        LABELS.append(10)
+    
+    return SAMPLES, LABELS
+
+
+# --- DEFINING A FUNCTION TO LOAD IN / GET READY DATA AND GENERAL TECH FOR MODEL BUILDING ---
+def load_and_prepare_mb_dataset(model_type, lf, lr, bs):
+    torch.manual_seed(42)                                                                                    # generating random seeds for reproducibility!
+    np.random.seed(42)
+    random.seed(42)
+
+    transform = transforms.Compose([                                                                        # defining transformations... i.e. images --> tensors 
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+
+    # Really Loading + Generating + Organizing Data
+    training = torchvision.datasets.SVHN(root='./data', split='train', download=True, transform=transform)  # loading in the CROPPED DIGIT DATASETS ALWAYS for training!
+    testing = torchvision.datasets.SVHN(root='./data',  split='test',  download=True, transform=transform)
+    non_digit_train_samples, non_digit_train_labels = generate_non_digit_samples(transform, len(training)//2)          # (generating those non-digit examples as well)
+    non_digit_test_samples,  non_digit_test_labels =  generate_non_digit_samples(transform, len(testing)//2)
+
+    svhn_train_samples = []
+    svhn_train_labels = []
+    svhn_test_samples = []
+    svhn_test_labels = []
+    for i in range(len(training)):
+        img, label = training[i]
+        svhn_train_samples.append(img)
+        svhn_train_labels.append(int(label))
+    for i in range(len(testing)):
+        img, label = testing[i]
+        svhn_test_samples.append(img)
+        svhn_test_labels.append(int(label))
+
+    train_samples = svhn_train_samples + non_digit_train_samples                                            # combining all data to create full digit + non-digit datasets
+    train_labels = svhn_train_labels + non_digit_train_labels
+    test_samples = svhn_test_samples + non_digit_test_samples
+    test_labels = svhn_test_labels + non_digit_test_labels
+    train_dataset = SimpleDataset(train_samples, train_labels)
+    test_dataset = SimpleDataset(test_samples, test_labels)
+
+
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size                                                              # splitting into single time validation + training
+    train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
+
+    batch_size = bs
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)                            # creating the dataloaders, i.e. things that efficiently load + batch during training
+    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+
+    # Instantiating Literally Everything (i.e. Model, Loss, Optimizer, etc)
+    if model_type == 'original':
+        model = CNN()
+    elif model_type == 'vgg16':
+        model = VGG16()
+
+    if lf=='cross-entropy':
         criterion = nn.CrossEntropyLoss()
-    elif loss_function=='mean-squared':
+    elif lf=='mean-squared':
         criterion = nn.MSELoss()
-    elif loss_function=='multi-margin':
+    elif lf=='multi-margin':
         criterion = nn.MultiMarginLoss()
-    else:
-        raise ValueError(f"Invalid loss function: {loss_function}")
+
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    device = torch.device("cpu")
+    model = model.to(device)
+    return model, train_loader, val_loader, test_loader, device
+
+
+# --- DEFINING A FUNCTION TO ACTUALLY TRAIN A MODEL ---
+def train_model(model, train_loader, val_loader, test_loader, device, lf, lr):
+    if lf=='cross-entropy':                                                                                 # declaring all the old model stuff wrt our hyperparam inputs
+        criterion = nn.CrossEntropyLoss()
+    elif lf=='mean-squared':
+        criterion = nn.MSELoss()
+    elif lf=='multi-margin':
+        criterion = nn.MultiMarginLoss()
+
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    best_val_acc = 0.0
+    associated_best_train_acc = 0.0
+
+    history = {
+        'train_acc': [],                                                                                    # stores training + validation accuracies 
+        'val_acc': []
+    }
     
-    # Model Initialization ......................................................................
-    if model_name == 'vgg16':
-        model = models.vgg16(weights='IMAGENET1K_V1')                                  # downloading a vgg16 with pre-trained weights
-        # for param in model.features.parameters():
-        #     param.requires_grad = False
-        model.classifier[6] = nn.Linear(4096, 11)                                      # adjusting for the now 11 classes
-    elif model_name == 'original':
-        model = CNN()                                                                  # reseting the model + optimizer each fold
-    else:
-        raise ValueError(f"Invalid model name: {model_name}")
-    
-    best_model = model # Keep track of the model instance.
-
-    # Training + Determining Training + Validation Error ........................................
-    training_error = 0
-    validation_error = 0
-
-    k = 5
-    kf = KFold(n_splits=k, shuffle=True, random_state=42)
-
-    for fold, (train_idx, val_idx) in enumerate(kf.split(training_dataset)):
-        print(f"Training fold {fold + 1}/{k}...")
-
-        # Separating Full Training Dataset into Training + Validation ...........................
-        training_subset = Subset(training_dataset, train_idx)                          # creating subsets + official dataloaders of the full training_dataset for cross validation
-        val_subset = Subset(training_dataset, val_idx)
+    for epoch in range(5):
+        # print(f'Epoch {epoch+1}/{num_epochs}')
         
-        training_loader = DataLoader(training_subset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
-
-
-        # (CNN) Model Initialization ............................................................
-        if model_name == 'original':
-            model = CNN()                                                              # reseting the model + optimizer each fold.  Create a new instance for each fold.
+        # MODEL IN TRAINING .................................................................................
+        model.train()
+        running_corrects = 0
+        total_samples = 0
         
-        optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)  # (optimizers adjust model parmeters to minimize the loss function!! it doesn't actually do the backprop, but updates the model using the gradients calculated during that)
-
-
-        # Training Loop .........................................................................
-        model.train()                                                                  # setting the model to training mode!
-        for epoch in range(5):                                                         # at a high level... for each testing + validation set combo, you train x epochs amount of times, and then you evaulate the validation accuracy
-            for inputs, labels in training_loader:
-                optimizer.zero_grad()                                                  # zero-ing out / restarting the gradients ... (BUT THE MODEL WEIGHTS ARE NEVER ZERO-ED!)
-                outputs = model(inputs)                                                # running all the input data through to get some predictions
-                loss = criterion(outputs, labels)                                      # calculating loss wrt the loss function, comparing the predictions with the actuals
-                loss.backward()                                                        # performs backprop
-                optimizer.step()                                                       # updates the model parameters using what was found during backprop
-
-
-        # Training Evaluation ....................................................................
-        model.eval()                                                                   # setting the model to evaluation mode!
-        correct_train, total_train = 0, 0
-        with torch.no_grad():                                                          # turns off gradient checking for memory-saving purposes
-            for inputs, labels in training_loader:                                     # loops through all the batches
-                outputs = model(inputs)                                                # gets the raw predictions back
-                _, predicted = torch.max(outputs, 1)                                   # gets the class with the highest score
-                total_train += labels.size(0)
-                correct_train += (predicted == labels).sum().item()
-        training_error_fold = (1 - (correct_train/total_train))
-
-        # Validation Evaluation ..................................................................
-        correct_val, total_val = 0, 0
+        for inputs, labels in train_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            
+            optimizer.zero_grad()
+            with torch.set_grad_enabled(True):
+                outputs = model(inputs)
+                _, preds = torch.max(outputs, 1)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+            
+            running_corrects += torch.sum(preds == labels.data)
+            total_samples += inputs.size(0)
+        
+        epoch_acc = running_corrects.double() / total_samples
+        history['train_acc'].append(epoch_acc.item())
+        
+        # MODEL IN (VALIDATION) EVALUATION ..................................................................
+        model.eval()
+        running_corrects = 0
+        total_samples = 0
+        
         with torch.no_grad():
             for inputs, labels in val_loader:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                
                 outputs = model(inputs)
-                _, predicted = torch.max(outputs, 1)
-                total_val += labels.size(0)
-                correct_val += (predicted == labels).sum().item()
-        validation_error_fold = (1 - (correct_val/total_val))
-
-
-        # Saving the Best Model!
-        if validation_error_fold < best_validation_error:
-            best_validation_error = validation_error_fold
-            best_model_state = model.state_dict()                                      # saving the model's weights
+                _, preds = torch.max(outputs, 1)
+                loss = criterion(outputs, labels)
+                
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+                total_samples += inputs.size(0)
         
-        print(f"Fold {fold + 1}: Training Error = {training_error_fold*100:.2f}%, Validation Error = {validation_error_fold*100:.2f}%")
-        training_error += training_error_fold
-        validation_error += validation_error_fold
+        epoch_acc = running_corrects.double() / total_samples
+        history['val_acc'].append(epoch_acc.item())
+                
+        # SAVING THE BEST MODEL PERFORMANCE .................................................................
+        if epoch_acc > best_val_acc:                                                                        # best = best performing on the validation set
+            best_val_acc = epoch_acc
+            associated_best_train_acc = history['train_acc'][-1]
+            torch.save(model.state_dict(), 'best_digit_classifier.pth')
+
+    return model, (1-associated_best_train_acc, 1-best_val_acc)                                             # returning ERROR RATE, not accuracy anymore
 
 
-    training_error /= k
-    validation_error /= k
-
-
-    # Testing Evaluation ........................................................................
-    testing_loader = DataLoader(testing_dataset, batch_size=batch_size, shuffle=False)
-
-    testing_error = 0
-    correct_test, total_test = 0, 0
-
+# --- DEFINING A FUNCTION TO ACTUALLY EVALUATE A MODEL on TESTING DATA EXPLICITLY ---
+def evaluate_model(model, dataloader):
+    # MODEL IN (TESTING) EVALUATION .........................................................................
     model.eval()
-    with torch.no_grad():
-        for inputs, labels in testing_loader:
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs, 1)
-            total_test += labels.size(0)
-            correct_test += (predicted == labels).sum().item()
     
-    testing_error = (1 - (correct_test/total_test))
+    running_corrects = 0
+    total_samples = 0
+    
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            
+            running_corrects += torch.sum(preds == labels.data)
+            total_samples += inputs.size(0)
+    
+    test_acc = running_corrects.double()/total_samples
+    return 1-test_acc.item()
 
-    end_time = time.time()
-    print(end_time - start_time)
 
-    # Saving the Overall Best Model!
-    if best_model_state is not None:
-        # best_model.load_state_dict(best_model_state)
-        if model_name == 'original':
-            path = os.path.join("..", "current-models", "original", f"{loss_function}-{str(learning_rate)}-{str(batch_size)}.pth")
-            torch.save(best_model_state, path)
-        elif model_name == 'vgg16':
-            path = os.path.join("..", "current-models", "vgg16", f"{loss_function}-{str(learning_rate)}-{str(batch_size)}.pth")
-            torch.save(best_model_state, path)
-    else:
-        print("Warning: No best model state found. Saving the last model.")
 
-    return training_error*100, validation_error*100, testing_error*100
+def model_development_and_evaluation_pipeline(model_type, lf, lr, bs):
 
+    model, train_loader, val_loader, test_loader, device = load_and_prepare_mb_dataset(model_type, lf, lr, bs)       # actually TRAINING the model
+    model, (train_er, best_val_er) = train_model(model, train_loader, val_loader, test_loader, device, lf, lr)
+    model.load_state_dict(torch.load('best_digit_classifier.pth'))                                          # loading the BEST one
+    test_er = evaluate_model(model, test_loader)
+
+    return train_er, best_val_er, test_er
 
 
 # --- DEFINING EASY-USE HYPERPARAMETER GRIDSEARCHING FUNCTION ---
